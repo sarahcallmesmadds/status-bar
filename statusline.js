@@ -1,14 +1,12 @@
 #!/usr/bin/env node
 // Claude Code statusline
-// Renders:  model │ folder ⎇ gh-account │ $cost  ████░░ usage%
+// Renders: model | folder/account | cost | context used | optional core-tool count
 //
 // Drop this file anywhere and point Claude Code at it in settings.json:
 //   "statusLine": { "type": "command", "command": "node \"/absolute/path/to/statusline.js\"" }
 //
-// Every segment is optional and degrades gracefully — if Claude Code doesn't
-// send cost or context data, that segment is simply omitted. The account
-// segment appears only when the current directory is inside a git repo; it is
-// read straight from the repo's remote URL (no shelling out to git/gh).
+// Every segment is optional and degrades gracefully. If Claude Code does not
+// send cost/context, or if the core-tool cache is missing, that piece is omitted.
 
 const fs = require('fs');
 const path = require('path');
@@ -18,13 +16,12 @@ const os = require('os');
 
 /**
  * Walk up from `dir` looking for a .git/config, read the first remote URL, and
- * return the owner/org portion of it (e.g. "acme" from git@github.com:acme/app.git).
- * Returns null when there's no repo or the URL can't be parsed.
+ * return the owner/org portion of it.
  *
- * Handles both HTTPS and SSH forms, including custom SSH host aliases:
+ * Handles HTTPS and SSH remotes, including custom SSH host aliases:
  *   https://github.com/OWNER/repo.git
  *   git@github.com:OWNER/repo.git
- *   git@my-ssh-alias:OWNER/repo.git
+ *   git@github-personal:OWNER/repo.git
  */
 function readGitOwner(dir) {
   let current = dir;
@@ -36,7 +33,6 @@ function readGitOwner(dir) {
         const cfg = fs.readFileSync(candidate, 'utf8');
         const m = cfg.match(/^\s*url\s*=\s*(.+)$/m);
         const url = m ? m[1].trim() : '';
-        // Grab the "owner/repo" tail after the last ':' or '/', tolerate a .git suffix.
         const parts = url.match(/[:/]([^/:]+)\/([^/]+?)(?:\.git)?\/?$/);
         return parts ? parts[1] : null;
       } catch (e) {
@@ -50,52 +46,96 @@ function readGitOwner(dir) {
   return null;
 }
 
-// --- main --------------------------------------------------------------------
+// --- Core tool health -------------------------------------------------------
+
+function readCoreToolsStatuslineSegment() {
+  const candidates = [
+    path.join(__dirname, 'core-mcp-health.js'),
+    path.join(os.homedir(), '.codex', 'hooks', 'core-mcp-health.js'),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) continue;
+      const health = require(candidate);
+      if (typeof health.formatStatuslineSegment === 'function') {
+        return health.formatStatuslineSegment({ runtime: 'codex' });
+      }
+    } catch (e) {
+      // Keep prompt rendering reliable even if the health helper is absent/broken.
+    }
+  }
+  return '';
+}
+
+// --- Display helpers --------------------------------------------------------
+
+function renderContextMeter(contextWindow) {
+  const remaining = contextWindow?.remaining_percentage;
+  if (remaining == null) return '';
+
+  const totalCtx = contextWindow?.total_tokens || 1_000_000;
+  const autoCompactWindow = parseInt(process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '0', 10);
+  const bufferPct = autoCompactWindow > 0
+    ? Math.min(100, (autoCompactWindow / totalCtx) * 100)
+    : 16.5;
+
+  const usableRemaining = Math.max(0, ((remaining - bufferPct) / (100 - bufferPct)) * 100);
+  const used = Math.max(0, Math.min(100, Math.round(100 - usableRemaining)));
+  const filled = Math.floor(used / 10);
+  const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
+
+  if (used >= 80) return ` \x1b[5;31m💀 ${bar} ${used}%\x1b[0m`;
+  if (used >= 65) return ` \x1b[38;5;208m${bar} ${used}%\x1b[0m`;
+  if (used >= 50) return ` \x1b[33m${bar} ${used}%\x1b[0m`;
+  return ` \x1b[32m${bar} ${used}%\x1b[0m`;
+}
+
+function renderCost(cost) {
+  const costUsd = cost?.total_cost_usd;
+  if (costUsd == null || isNaN(costUsd)) return '';
+  return ` │ \x1b[36m$${Number(costUsd).toFixed(2)}\x1b[0m`;
+}
+
+function composeStatusline({
+  model,
+  dirname,
+  owner = '',
+  cost = '',
+  context = '',
+  coreTools = '',
+} = {}) {
+  const modelSeg = `\x1b[2m${model || 'Claude'}\x1b[0m`;
+  const ownerSeg = owner ? ` \x1b[2m⎇ ${owner}\x1b[0m` : '';
+  const dirSeg = `\x1b[2m${dirname || ''}\x1b[0m${ownerSeg}`;
+  return `${modelSeg} │ ${dirSeg}${cost}${context}${coreTools}`;
+}
+
+// --- main ------------------------------------------------------------------
+
+function renderStatusline(data) {
+  const dir = data.workspace?.current_dir || process.cwd();
+  return composeStatusline({
+    model: data.model?.display_name || 'Claude',
+    dirname: path.basename(dir),
+    owner: readGitOwner(dir),
+    cost: renderCost(data.cost),
+    context: renderContextMeter(data.context_window),
+    coreTools: readCoreToolsStatuslineSegment(),
+  });
+}
 
 function run() {
   let input = '';
-  // If stdin never closes (rare pipe issues), exit quietly rather than hang.
   const timeout = setTimeout(() => process.exit(0), 3000);
   process.stdin.setEncoding('utf8');
-  process.stdin.on('data', c => (input += c));
+  process.stdin.on('data', (chunk) => {
+    input += chunk;
+  });
   process.stdin.on('end', () => {
     clearTimeout(timeout);
     try {
-      const data = JSON.parse(input);
-      const model = data.model?.display_name || 'Claude';
-      const dir = data.workspace?.current_dir || process.cwd();
-      const dirname = path.basename(dir);
-
-      // Context usage meter (shows USED percentage). Claude Code sends
-      // remaining_percentage; we render a 10-cell bar and color by pressure.
-      let ctx = '';
-      const remaining = data.context_window?.remaining_percentage;
-      if (remaining != null) {
-        const used = Math.max(0, Math.min(100, Math.round(100 - remaining)));
-        const filled = Math.floor(used / 10);
-        const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
-        let color = '\x1b[32m';                 // green
-        if (used >= 80) color = '\x1b[31m';      // red
-        else if (used >= 65) color = '\x1b[38;5;208m'; // orange
-        else if (used >= 50) color = '\x1b[33m'; // yellow
-        ctx = ` ${color}${bar} ${used}%\x1b[0m`;
-      }
-
-      // Session cost (USD), when Claude Code provides it.
-      let cost = '';
-      const costUsd = data.cost?.total_cost_usd;
-      if (costUsd != null && !isNaN(costUsd)) {
-        cost = ` │ \x1b[36m$${Number(costUsd).toFixed(2)}\x1b[0m`;
-      }
-
-      // GitHub account segment, only inside a git repo.
-      let account = '';
-      const owner = readGitOwner(dir);
-      if (owner) account = ` \x1b[2m⎇ ${owner}\x1b[0m`;
-
-      const modelSeg = `\x1b[2m${model}\x1b[0m`;
-      const dirSeg = `\x1b[2m${dirname}\x1b[0m${account}`;
-      process.stdout.write(`${modelSeg} │ ${dirSeg}${cost}${ctx}`);
+      process.stdout.write(renderStatusline(JSON.parse(input)));
     } catch (e) {
       // Never break the shell prompt on a bad/empty payload.
     }
@@ -104,4 +144,11 @@ function run() {
 
 if (require.main === module) run();
 
-module.exports = { readGitOwner };
+module.exports = {
+  readGitOwner,
+  readCoreToolsStatuslineSegment,
+  renderContextMeter,
+  renderCost,
+  composeStatusline,
+  renderStatusline,
+};

@@ -1,11 +1,11 @@
-# claude-statusline
+# status-bar
 
-A tiny, dependency-free status line for [Claude Code](https://claude.com/claude-code).
+A tiny, dependency-free status line for Claude Code, plus a Codex-friendly companion indicator for Sarah's core tool auth status.
 
-It shows, in one line at the bottom of your terminal:
+In Claude Code it shows, in one line at the bottom of your terminal:
 
 ```
-Claude 4.8 │ my-project ⎇ owner │ $0.42 ████░░░░░░ 41%
+Claude 4.8 │ my-project ⎇ owner │ $0.42 ████░░░░░░ 41% │ Core tools 5/5
 ```
 
 | Segment | What it tells you |
@@ -15,10 +15,11 @@ Claude 4.8 │ my-project ⎇ owner │ $0.42 ████░░░░░░ 41%
 | `⎇ owner` | The GitHub owner/org of the current repo, read from its git remote. Handy when you push under more than one account. Omitted outside a git repo. |
 | `$0.42` | Running session cost in USD (when Claude Code reports it) |
 | `████░░ 41%` | Context window used, colored green → yellow → orange → red as it fills |
+| `Core tools 5/5` | Last-known auth count for Email, Calendar, Slack, Granola, and Notion |
 
 Every segment is optional and degrades gracefully. If Claude Code doesn't send cost or context data, that piece is simply left out — the line never errors.
 
-## Install
+## Install for Claude Code
 
 1. Copy `statusline.js` anywhere on your machine.
 2. Point Claude Code at it in your `settings.json`:
@@ -36,6 +37,41 @@ Every segment is optional and degrades gracefully. If Claude Code doesn't send c
 
 Requires Node.js (already present if you run Claude Code). No npm install, no dependencies — it's a single file.
 
+## Codex setup
+
+Codex does not currently allow arbitrary custom items inside its bottom footer. Use Codex's built-in footer for usage:
+
+```toml
+[tui]
+status_line = [
+    "model-with-reasoning",
+    "context-used",
+    "five-hour-limit",
+    "weekly-limit",
+    "used-tokens",
+    "project-name",
+    "git-branch",
+]
+status_line_use_colors = true
+```
+
+For the core-tool count, use `core-mcp-health.js` as a prompt-start hook:
+
+```json
+{
+  "type": "command",
+  "command": "node \"/absolute/path/to/core-mcp-health.js\" banner"
+}
+```
+
+That renders a banner like:
+
+```text
+Core tools last check: 5/5 auth'd · checked 10:07 AM ET
+```
+
+The helper reads `~/.cache/ai-core-mcp-health.json`. It is a cache, not a live auth probe, because local statusline/hook scripts cannot call Codex connector tools directly.
+
 ## How the account segment works
 
 It walks up from your current directory to find the repo's `.git/config`, reads the first remote `url`, and pulls the owner out of it. It handles both HTTPS and SSH remotes, including custom SSH host aliases:
@@ -50,12 +86,13 @@ It reads the file directly — no `git` or `gh` subprocess — so it adds no lat
 
 ## Customizing
 
-The whole thing is ~120 readable lines in `statusline.js`. To change colors, thresholds, or which segments show, edit that file directly. Common tweaks:
+The whole thing is readable JavaScript. To change colors, thresholds, or which segments show, edit `statusline.js` directly. Common tweaks:
 
-- **Reorder / drop segments** — edit the final `process.stdout.write(...)` line.
+- **Reorder / drop segments** — edit `composeStatusline(...)`.
 - **Context bar colors** — adjust the thresholds in the context block.
 - **Cost precision** — change `.toFixed(2)`.
+- **Core tools** — edit `CORE_TOOLS` and `LABELS` in `core-mcp-health.js`.
 
 ## License
 
-MIT. Add a `LICENSE` file with your name when you publish.
+MIT.
