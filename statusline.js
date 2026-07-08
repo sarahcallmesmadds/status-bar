@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Claude Code statusline
-// Renders: model | folder/account | cost | context used | optional core-tool count
+// Renders: model | folder/account | session cost + rolling spend | context used | optional core-tool count
 //
 // Drop this file anywhere and point Claude Code at it in settings.json:
 //   "statusLine": { "type": "command", "command": "node \"/absolute/path/to/statusline.js\"" }
@@ -11,6 +11,10 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+
+const ROLLING_SPEND_CACHE_PATH = process.env.STATUS_BAR_ROLLING_SPEND_CACHE_PATH
+  || path.join(os.homedir(), '.cache', 'status-bar', 'claude-rolling-spend.json');
+const ROLLING_SPEND_DAYS = 30;
 
 // --- GitHub account reader --------------------------------------------------
 
@@ -70,6 +74,92 @@ function readCoreToolsStatuslineSegment() {
 
 // --- Display helpers --------------------------------------------------------
 
+function formatUsd(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return '0.00';
+  if (amount >= 1000) return Math.round(amount).toLocaleString('en-US');
+  if (amount >= 100) return amount.toFixed(0);
+  return amount.toFixed(2);
+}
+
+function readJsonFile(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeJsonFile(filePath, data) {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tmpPath = `${filePath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpPath, `${JSON.stringify(data, null, 2)}\n`);
+    fs.renameSync(tmpPath, filePath);
+  } catch (e) {
+    // Spend tracking is best-effort; never break prompt rendering.
+  }
+}
+
+function updateRollingSpend(data, now = new Date()) {
+  const costUsd = Number(data.cost?.total_cost_usd);
+  const sessionId = data.session_id || data.transcript_path;
+  if (!sessionId || !Number.isFinite(costUsd) || costUsd < 0) return null;
+
+  const nowMs = now.getTime();
+  const nowIso = now.toISOString();
+  const cutoffMs = nowMs - (ROLLING_SPEND_DAYS * 24 * 60 * 60 * 1000);
+  const cache = readJsonFile(ROLLING_SPEND_CACHE_PATH) || {};
+  const sessions = cache.sessions && typeof cache.sessions === 'object' ? cache.sessions : {};
+  const previous = sessions[sessionId] || {};
+
+  sessions[sessionId] = {
+    cost_usd: costUsd,
+    first_seen_at: previous.first_seen_at || nowIso,
+    last_seen_at: nowIso,
+  };
+
+  for (const [key, value] of Object.entries(sessions)) {
+    const seenAt = new Date(value.last_seen_at || value.first_seen_at || 0).getTime();
+    if (!Number.isFinite(seenAt) || seenAt < cutoffMs) delete sessions[key];
+  }
+
+  const total = Object.values(sessions).reduce((sum, value) => {
+    const sessionCost = Number(value.cost_usd);
+    return Number.isFinite(sessionCost) ? sum + sessionCost : sum;
+  }, 0);
+
+  writeJsonFile(ROLLING_SPEND_CACHE_PATH, {
+    version: 1,
+    window_days: ROLLING_SPEND_DAYS,
+    updated_at: nowIso,
+    sessions,
+  });
+
+  return { total, sessionCount: Object.keys(sessions).length };
+}
+
+function renderRollingSpend(data) {
+  const spend = updateRollingSpend(data);
+  if (!spend) return '';
+
+  const limitRaw = process.env.CLAUDE_30D_SPEND_LIMIT_USD || process.env.CLAUDE_MONTHLY_SPEND_LIMIT_USD;
+  const limit = Number(limitRaw);
+  let text = `30d $${formatUsd(spend.total)} est`;
+  let colorCode = '35';
+
+  if (Number.isFinite(limit) && limit > 0) {
+    const pct = Math.round((spend.total / limit) * 100);
+    text = `30d $${formatUsd(spend.total)}/$${formatUsd(limit)} ${pct}% est`;
+    if (pct >= 90) colorCode = '31';
+    else if (pct >= 75) colorCode = '38;5;208';
+    else if (pct >= 50) colorCode = '33';
+    else colorCode = '35';
+  }
+
+  return ` · \x1b[${colorCode}m${text}\x1b[0m`;
+}
+
 function renderContextMeter(contextWindow) {
   const remaining = contextWindow?.remaining_percentage;
   if (remaining == null) return '';
@@ -91,10 +181,10 @@ function renderContextMeter(contextWindow) {
   return ` \x1b[32m${bar} ${used}%\x1b[0m`;
 }
 
-function renderCost(cost) {
-  const costUsd = cost?.total_cost_usd;
+function renderCost(data) {
+  const costUsd = data.cost?.total_cost_usd;
   if (costUsd == null || isNaN(costUsd)) return '';
-  return ` │ \x1b[36m$${Number(costUsd).toFixed(2)}\x1b[0m`;
+  return ` │ \x1b[36m$${Number(costUsd).toFixed(2)}\x1b[0m${renderRollingSpend(data)}`;
 }
 
 function composeStatusline({
@@ -119,7 +209,7 @@ function renderStatusline(data) {
     model: data.model?.display_name || 'Claude',
     dirname: path.basename(dir),
     owner: readGitOwner(dir),
-    cost: renderCost(data.cost),
+    cost: renderCost(data),
     context: renderContextMeter(data.context_window),
     coreTools: readCoreToolsStatuslineSegment(),
   });
@@ -147,6 +237,9 @@ if (require.main === module) run();
 module.exports = {
   readGitOwner,
   readCoreToolsStatuslineSegment,
+  formatUsd,
+  updateRollingSpend,
+  renderRollingSpend,
   renderContextMeter,
   renderCost,
   composeStatusline,
